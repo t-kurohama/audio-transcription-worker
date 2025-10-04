@@ -1,0 +1,11 @@
+name = "flat-paper-c3c1"
+main = "src/index.js"
+compatibility_date = "2024-01-01"
+
+[[r2_buckets]]
+binding = "AUDIO_BUCKET"
+bucket_name = "audio-input"
+
+[[r2_buckets]]
+binding = "RESULT_BUCKET"
+bucket_name = "audio-transcription"
