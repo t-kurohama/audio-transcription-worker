@@ -1,5 +1,3 @@
-// src/index.js
-
 function jsonResponse(data, status = 200) {
   return new Response(JSON.stringify(data), {
     status,
@@ -35,7 +33,7 @@ export default {
       return new Response(null, {
         headers: {
           'Access-Control-Allow-Origin': '*',
-          'Access-Control-Allow-Methods': 'POST, OPTIONS',
+          'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
           'Access-Control-Allow-Headers': 'Content-Type'
         }
       });
@@ -43,6 +41,11 @@ export default {
     
     if (request.method === 'POST' && url.pathname === '/') {
       return handleUpload(request, env, url);
+    }
+    
+    if (request.method === 'GET' && url.pathname.startsWith('/download/')) {
+      const fileName = url.pathname.split('/')[2];
+      return handleDownload(request, env, fileName);
     }
     
     if (request.method === 'POST' && url.pathname.startsWith('/webhook/')) {
@@ -77,14 +80,15 @@ async function handleUpload(request, env, url) {
         contentType: audioFile.type || 'audio/wav'
       }
     });
+    console.log('[INFO] R2 upload done');
     
-    // 公開URL生成
-    const audioUrl = `${env.R2_PUBLIC_URL}/${audioFileName}`;
-    console.log('[INFO] Audio URL:', audioUrl);
+    // Workers経由のダウンロードURL生成
+    const audioUrl = `${url.origin}/download/${audioFileName}`;
+    console.log('[INFO] Download URL:', audioUrl);
     
     // RunPod呼び出し
     const webhookUrl = `${url.origin}/webhook/${jobId}`;
-    console.log('[INFO] Calling RunPod:', env.RUNPOD_ENDPOINT);
+    console.log('[INFO] Calling RunPod');
     
     const runpodResponse = await retryFetch(`${env.RUNPOD_ENDPOINT}/run`, {
       method: 'POST',
@@ -102,8 +106,6 @@ async function handleUpload(request, env, url) {
     });
     
     if (!runpodResponse.ok) {
-      const errorText = await runpodResponse.text();
-      console.log('[ERROR] RunPod error:', runpodResponse.status, errorText);
       throw new Error(`RunPod error: ${runpodResponse.status}`);
     }
     
@@ -118,6 +120,30 @@ async function handleUpload(request, env, url) {
   } catch (error) {
     console.error('[ERROR]', error.message);
     return jsonResponse({ error: error.message }, 500);
+  }
+}
+
+async function handleDownload(request, env, fileName) {
+  console.log('[INFO] Download request:', fileName);
+  try {
+    const object = await env.AUDIO_BUCKET.get(fileName);
+    
+    if (!object) {
+      console.error('[ERROR] File not found:', fileName);
+      return new Response('File not found', { status: 404 });
+    }
+    
+    console.log('[INFO] Serving file:', fileName);
+    return new Response(object.body, {
+      headers: {
+        'Content-Type': object.httpMetadata?.contentType || 'audio/wav',
+        'Cache-Control': 'public, max-age=3600',
+        'Access-Control-Allow-Origin': '*'
+      }
+    });
+  } catch (error) {
+    console.error('[ERROR]', error.message);
+    return new Response('Error', { status: 500 });
   }
 }
 
