@@ -265,7 +265,7 @@ async function sendSlack(env, jobId, status, fileNameOrUrl, error) {
   
   if (status === 'SUCCESS') {
     message = {
-      text: '完了',
+      text: '<!channel> 完了',
       blocks: [
         { type: 'header', text: { type: 'plain_text', text: '✅ 完了' } },
         { type: 'section', fields: [
@@ -279,23 +279,23 @@ async function sendSlack(env, jobId, status, fileNameOrUrl, error) {
     };
   } else if (status === 'DRIVE_SUCCESS') {
     message = {
-      text: 'Drive保存完了',
+      text: '<!channel> Drive保存完了',
       blocks: [
         { type: 'header', text: { type: 'plain_text', text: '📁 Drive保存完了' } },
-        { type: 'section', text: { type: 'mrkdwn', text: `${fileNameOrUrl}` }}
+        { type: 'section', text: { type: 'mrkdwn', text: `<!channel>\n${fileNameOrUrl}` }}
       ]
     };
   } else if (status === 'DRIVE_FAILED') {
     message = {
-      text: 'Drive保存失敗',
+      text: '<!channel> Drive保存失敗',
       blocks: [
         { type: 'header', text: { type: 'plain_text', text: '⚠️ Drive保存失敗' } },
-        { type: 'section', text: { type: 'mrkdwn', text: `エラー: ${error}` }}
+        { type: 'section', text: { type: 'mrkdwn', text: `<!channel>\nエラー: ${error}` }}
       ]
     };
   } else {
     message = {
-      text: '失敗',
+      text: '<!channel> 失敗',
       blocks: [
         { type: 'header', text: { type: 'plain_text', text: '❌ 失敗' } },
         { type: 'section', fields: [
