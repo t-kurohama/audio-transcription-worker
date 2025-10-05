@@ -44,8 +44,13 @@ export default {
     }
     
     if (request.method === 'GET' && url.pathname.startsWith('/download/')) {
-      const fileName = url.pathname.split('/')[2];
+      const fileName = url.pathname.split('/').slice(2).join('/');
       return handleDownload(request, env, fileName);
+    }
+    
+    if (request.method === 'GET' && url.pathname.startsWith('/download-result/')) {
+      const filePath = url.pathname.substring(17);
+      return handleDownloadResult(request, env, filePath);
     }
     
     if (request.method === 'POST' && url.pathname.startsWith('/webhook/')) {
@@ -62,16 +67,23 @@ async function handleUpload(request, env, url) {
   try {
     const formData = await request.formData();
     const audioFile = formData.get('audio');
+    const client = formData.get('client');
+    const vid = formData.get('vid');
     
     if (!audioFile) {
       return jsonResponse({ error: 'No audio file' }, 400);
     }
     
+    if (!client || !vid) {
+      return jsonResponse({ error: 'client and vid are required' }, 400);
+    }
+    
     const jobId = crypto.randomUUID();
     console.log('[INFO] JobId:', jobId);
+    console.log('[INFO] Client:', client, 'Vid:', vid);
     
-    // R2にアップロード
-    const audioFileName = `${jobId}.wav`;
+    // R2にアップロード（パスを動的に）
+    const audioFileName = `projects/${client}/${vid}/${jobId}.wav`;
     const arrayBuffer = await audioFile.arrayBuffer();
     
     console.log('[INFO] Uploading to R2...');
@@ -100,7 +112,9 @@ async function handleUpload(request, env, url) {
         input: {
           audio_url: audioUrl,
           webhook: webhookUrl,
-          lang: 'ja'
+          lang: 'ja',
+          client: client,
+          vid: vid
         }
       })
     });
@@ -147,6 +161,30 @@ async function handleDownload(request, env, fileName) {
   }
 }
 
+async function handleDownloadResult(request, env, filePath) {
+  console.log('[INFO] Download result request:', filePath);
+  try {
+    const object = await env.RESULT_BUCKET.get(filePath);
+    
+    if (!object) {
+      console.error('[ERROR] File not found:', filePath);
+      return new Response('File not found', { status: 404 });
+    }
+    
+    console.log('[INFO] Serving result file:', filePath);
+    return new Response(object.body, {
+      headers: {
+        'Content-Type': 'application/json',
+        'Cache-Control': 'public, max-age=3600',
+        'Access-Control-Allow-Origin': '*'
+      }
+    });
+  } catch (error) {
+    console.error('[ERROR]', error.message);
+    return new Response('Error', { status: 500 });
+  }
+}
+
 async function handleWebhook(request, env, jobId) {
   console.log('[INFO] Webhook:', jobId);
   try {
@@ -157,12 +195,51 @@ async function handleWebhook(request, env, jobId) {
       return new Response('Job failed', { status: 200 });
     }
     
+    // client/vidを取得（RunPodから返される）
+    const client = data.input?.client || 'unknown';
+    const vid = data.input?.vid || 'unknown';
+    
     const fileName = `segments_${jobId}.json`;
-    await env.RESULT_BUCKET.put(fileName, JSON.stringify(data.output, null, 2), {
+    const filePath = `projects/${client}/${vid}/${fileName}`;
+    
+    await env.RESULT_BUCKET.put(filePath, JSON.stringify(data.output, null, 2), {
       httpMetadata: { contentType: 'application/json' }
     });
     
-    await sendSlack(env, jobId, 'SUCCESS', fileName, null);
+    await sendSlack(env, jobId, 'SUCCESS', filePath, null);
+    
+    // Apps Script呼び出し
+    if (env.APPS_SCRIPT_URL) {
+      try {
+        const signedUrl = `https://flat-paper-c3c1.throbbing-shadow-24bc.workers.dev/download-result/${filePath}`;
+        
+        const gasResponse = await fetch(env.APPS_SCRIPT_URL, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json'
+          },
+          body: JSON.stringify({
+            r2_url: signedUrl,
+            file_name: 'segments.json',
+            client: client,
+            vid: vid
+          })
+        });
+        
+        const gasResult = await gasResponse.json();
+        
+        if (gasResult.success) {
+          await sendSlack(env, jobId, 'DRIVE_SUCCESS', gasResult.driveUrl, null);
+        } else {
+          await sendSlack(env, jobId, 'DRIVE_FAILED', null, gasResult.error);
+        }
+        
+      } catch (error) {
+        console.error('[ERROR] Apps Script call failed:', error);
+        await sendSlack(env, jobId, 'DRIVE_FAILED', null, error.message);
+      }
+    }
+    
     return new Response('OK', { status: 200 });
   } catch (error) {
     console.error('[ERROR]', error.message);
@@ -171,31 +248,51 @@ async function handleWebhook(request, env, jobId) {
   }
 }
 
-async function sendSlack(env, jobId, status, fileName, error) {
-  const message = status === 'SUCCESS'
-    ? {
-        text: '完了',
-        blocks: [
-          { type: 'header', text: { type: 'plain_text', text: '✅ 完了' } },
-          { type: 'section', fields: [
-            { type: 'mrkdwn', text: `*ジョブID:*\n\`${jobId}\`` },
-            { type: 'mrkdwn', text: `*ファイル:*\n\`${fileName}\`` }
-          ]},
-          { type: 'section', text: { type: 'mrkdwn', 
-            text: `ダウンロード:\n\`\`\`wrangler r2 object get audio-transcription/${fileName} --file ${fileName}\`\`\`` 
-          }}
-        ]
-      }
-    : {
-        text: '失敗',
-        blocks: [
-          { type: 'header', text: { type: 'plain_text', text: '❌ 失敗' } },
-          { type: 'section', fields: [
-            { type: 'mrkdwn', text: `*ジョブID:*\n\`${jobId}\`` },
-            { type: 'mrkdwn', text: `*エラー:*\n${error}` }
-          ]}
-        ]
-      };
+async function sendSlack(env, jobId, status, fileNameOrUrl, error) {
+  let message;
+  
+  if (status === 'SUCCESS') {
+    message = {
+      text: '完了',
+      blocks: [
+        { type: 'header', text: { type: 'plain_text', text: '✅ 完了' } },
+        { type: 'section', fields: [
+          { type: 'mrkdwn', text: `*ジョブID:*\n\`${jobId}\`` },
+          { type: 'mrkdwn', text: `*ファイル:*\n\`${fileNameOrUrl}\`` }
+        ]},
+        { type: 'section', text: { type: 'mrkdwn', 
+          text: `ダウンロード:\n\`\`\`wrangler r2 object get audio-transcription/${fileNameOrUrl} --file result.json --remote\`\`\`` 
+        }}
+      ]
+    };
+  } else if (status === 'DRIVE_SUCCESS') {
+    message = {
+      text: 'Drive保存完了',
+      blocks: [
+        { type: 'header', text: { type: 'plain_text', text: '📁 Drive保存完了' } },
+        { type: 'section', text: { type: 'mrkdwn', text: `${fileNameOrUrl}` }}
+      ]
+    };
+  } else if (status === 'DRIVE_FAILED') {
+    message = {
+      text: 'Drive保存失敗',
+      blocks: [
+        { type: 'header', text: { type: 'plain_text', text: '⚠️ Drive保存失敗' } },
+        { type: 'section', text: { type: 'mrkdwn', text: `エラー: ${error}` }}
+      ]
+    };
+  } else {
+    message = {
+      text: '失敗',
+      blocks: [
+        { type: 'header', text: { type: 'plain_text', text: '❌ 失敗' } },
+        { type: 'section', fields: [
+          { type: 'mrkdwn', text: `*ジョブID:*\n\`${jobId}\`` },
+          { type: 'mrkdwn', text: `*エラー:*\n${error}` }
+        ]}
+      ]
+    };
+  }
   
   await fetch(env.SLACK_WEBHOOK_URL, {
     method: 'POST',
