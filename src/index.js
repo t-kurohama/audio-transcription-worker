@@ -210,8 +210,17 @@ async function handleWebhook(request, env, jobId) {
     
     // Apps Script呼び出し
     if (env.APPS_SCRIPT_URL) {
+      console.log('[INFO] Calling Google Apps Script...');
+      
       try {
         const signedUrl = `https://flat-paper-c3c1.throbbing-shadow-24bc.workers.dev/download-result/${filePath}`;
+        
+        console.log('[INFO] Apps Script payload:', JSON.stringify({
+          r2_url: signedUrl,
+          file_name: 'segments.json',
+          client: client,
+          vid: vid
+        }));
         
         const gasResponse = await fetch(env.APPS_SCRIPT_URL, {
           method: 'POST',
@@ -227,15 +236,18 @@ async function handleWebhook(request, env, jobId) {
         });
         
         const gasResult = await gasResponse.json();
+        console.log('[INFO] Apps Script response:', JSON.stringify(gasResult));
         
         if (gasResult.success) {
+          console.log('[SUCCESS] Google Drive upload complete:', gasResult.driveUrl);
           await sendSlack(env, jobId, 'DRIVE_SUCCESS', gasResult.driveUrl, null);
         } else {
+          console.log('[ERROR] Google Drive upload failed:', gasResult.error);
           await sendSlack(env, jobId, 'DRIVE_FAILED', null, gasResult.error);
         }
         
       } catch (error) {
-        console.error('[ERROR] Apps Script call failed:', error);
+        console.error('[ERROR] Apps Script call failed:', error.message);
         await sendSlack(env, jobId, 'DRIVE_FAILED', null, error.message);
       }
     }
