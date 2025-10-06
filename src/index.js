@@ -69,6 +69,7 @@ async function handleUpload(request, env, url) {
     const audioFile = formData.get('audio');
     const client = formData.get('client');
     const vid = formData.get('vid');
+    const numSpeakers = formData.get('num_speakers');
     
     if (!audioFile) {
       return jsonResponse({ error: 'No audio file' }, 400);
@@ -78,11 +79,14 @@ async function handleUpload(request, env, url) {
       return jsonResponse({ error: 'client and vid are required' }, 400);
     }
     
+    if (!numSpeakers) {
+      return jsonResponse({ error: 'num_speakers is required' }, 400);
+    }
+    
     const jobId = crypto.randomUUID();
     console.log('[INFO] JobId:', jobId);
-    console.log('[INFO] Client:', client, 'Vid:', vid);
+    console.log('[INFO] Client:', client, 'Vid:', vid, 'Speakers:', numSpeakers);
     
-    // R2にアップロード（パスを動的に）
     const audioFileName = `projects/${client}/${vid}/${jobId}.wav`;
     const arrayBuffer = await audioFile.arrayBuffer();
     
@@ -94,11 +98,9 @@ async function handleUpload(request, env, url) {
     });
     console.log('[INFO] R2 upload done');
     
-    // Workers経由のダウンロードURL生成
     const audioUrl = `${url.origin}/download/${audioFileName}`;
     console.log('[INFO] Download URL:', audioUrl);
     
-    // RunPod呼び出し
     const webhookUrl = `${url.origin}/webhook/${jobId}`;
     console.log('[INFO] Calling RunPod');
     
@@ -114,7 +116,8 @@ async function handleUpload(request, env, url) {
           webhook: webhookUrl,
           lang: 'ja',
           client: client,
-          vid: vid
+          vid: vid,
+          num_speakers: parseInt(numSpeakers)
         }
       })
     });
@@ -195,7 +198,6 @@ async function handleWebhook(request, env, jobId) {
       return new Response('Job failed', { status: 200 });
     }
     
-    // client/vidを取得（RunPodから返される）
     const client = data.input?.client || 'unknown';
     const vid = data.input?.vid || 'unknown';
     
@@ -208,7 +210,6 @@ async function handleWebhook(request, env, jobId) {
     
     await sendSlack(env, jobId, 'SUCCESS', filePath, null);
     
-    // Apps Script呼び出し
     if (env.APPS_SCRIPT_URL) {
       console.log('[INFO] Calling Google Apps Script...');
       
@@ -241,7 +242,6 @@ async function handleWebhook(request, env, jobId) {
         if (gasResult.success) {
           console.log('[SUCCESS] Google Drive upload complete:', gasResult.jsonUrl, gasResult.srtUrl);
           
-          // Slack通知（JSON + SRT）
           await fetch(env.SLACK_WEBHOOK_URL, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
@@ -287,14 +287,6 @@ async function sendSlack(env, jobId, status, fileNameOrUrl, error) {
         { type: 'section', text: { type: 'mrkdwn', 
           text: `ダウンロード:\n\`\`\`wrangler r2 object get audio-transcription/${fileNameOrUrl} --file result.json --remote\`\`\`` 
         }}
-      ]
-    };
-  } else if (status === 'DRIVE_SUCCESS') {
-    message = {
-      text: '<!channel> Drive保存完了',
-      blocks: [
-        { type: 'header', text: { type: 'plain_text', text: '📁 Drive保存完了' } },
-        { type: 'section', text: { type: 'mrkdwn', text: `<!channel>\n${fileNameOrUrl}` }}
       ]
     };
   } else if (status === 'DRIVE_FAILED') {
