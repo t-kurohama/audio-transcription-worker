@@ -239,8 +239,20 @@ async function handleWebhook(request, env, jobId) {
         console.log('[INFO] Apps Script response:', JSON.stringify(gasResult));
         
         if (gasResult.success) {
-          console.log('[SUCCESS] Google Drive upload complete:', gasResult.driveUrl);
-          await sendSlack(env, jobId, 'DRIVE_SUCCESS', gasResult.driveUrl, null);
+          console.log('[SUCCESS] Google Drive upload complete:', gasResult.jsonUrl, gasResult.srtUrl);
+          
+          // Slack通知（JSON + SRT）
+          await fetch(env.SLACK_WEBHOOK_URL, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              text: '<!channel> Drive保存完了',
+              blocks: [
+                { type: 'header', text: { type: 'plain_text', text: '📁 Drive保存完了' } },
+                { type: 'section', text: { type: 'mrkdwn', text: `<!channel>\n📄 JSON: ${gasResult.jsonUrl}\n📝 SRT: ${gasResult.srtUrl}\n📂 ${gasResult.path}` }}
+              ]
+            })
+          });
         } else {
           console.log('[ERROR] Google Drive upload failed:', gasResult.error);
           await sendSlack(env, jobId, 'DRIVE_FAILED', null, gasResult.error);
