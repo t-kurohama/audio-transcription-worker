@@ -102,36 +102,84 @@ async function handleUpload(request, env, url) {
     console.log('[INFO] Download URL:', audioUrl);
     
     const webhookUrl = `${url.origin}/webhook/${jobId}`;
-    console.log('[INFO] Calling RunPod');
+    console.log('[INFO] Calling Replicate API - WhisperX');
     
-    const runpodResponse = await retryFetch(`${env.RUNPOD_ENDPOINT}/run`, {
+    // WhisperX実行
+    const whisperxResponse = await retryFetch('https://api.replicate.com/v1/predictions', {
       method: 'POST',
       headers: {
-        'Authorization': `Bearer ${env.RUNPOD_API_KEY}`,
+        'Authorization': `Token ${env.REPLICATE_API_TOKEN}`,
         'Content-Type': 'application/json'
       },
       body: JSON.stringify({
+        version: 'd56a8a6bf25c1e17f476e2f3daa8b7c2e4f4dbe757ef5c8b504785e5112c76bb',
         input: {
-          audio_url: audioUrl,
-          webhook: webhookUrl,
-          lang: 'ja',
-          client: client,
-          vid: vid,
-          num_speakers: parseInt(numSpeakers)
-        }
+          audio: audioUrl,
+          language: 'ja',
+          batch_size: 24,
+          diarization: false
+        },
+        webhook: `${webhookUrl}?type=whisperx`,
+        webhook_events_filter: ['completed']
       })
     });
     
-    if (!runpodResponse.ok) {
-      throw new Error(`RunPod error: ${runpodResponse.status}`);
+    if (!whisperxResponse.ok) {
+      const errorText = await whisperxResponse.text();
+      throw new Error(`Replicate WhisperX error: ${whisperxResponse.status} - ${errorText}`);
     }
     
-    const runpodData = await runpodResponse.json();
-    console.log('[SUCCESS] Job started');
+    const whisperxData = await whisperxResponse.json();
+    console.log('[INFO] WhisperX job started:', whisperxData.id);
+    
+    // Pyannote実行
+    console.log('[INFO] Calling Replicate API - Pyannote');
+    const pyannoteResponse = await retryFetch('https://api.replicate.com/v1/predictions', {
+      method: 'POST',
+      headers: {
+        'Authorization': `Token ${env.REPLICATE_API_TOKEN}`,
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify({
+        version: '1c597f468b34e7d3a8ddec528d1d39059b12b6b7a2cd7b31b77c8cf257a9e022',
+        input: {
+          audio: audioUrl,
+          min_speakers: Math.max(1, parseInt(numSpeakers) - 1),
+          max_speakers: parseInt(numSpeakers) + 2
+        },
+        webhook: `${webhookUrl}?type=pyannote`,
+        webhook_events_filter: ['completed']
+      })
+    });
+    
+    if (!pyannoteResponse.ok) {
+      const errorText = await pyannoteResponse.text();
+      throw new Error(`Replicate Pyannote error: ${pyannoteResponse.status} - ${errorText}`);
+    }
+    
+    const pyannoteData = await pyannoteResponse.json();
+    console.log('[INFO] Pyannote job started:', pyannoteData.id);
+    
+    // ジョブIDを保存（両方のIDを記録）
+    await env.AUDIO_BUCKET.put(`jobs/${jobId}.json`, JSON.stringify({
+      jobId: jobId,
+      whisperxId: whisperxData.id,
+      pyannoteId: pyannoteData.id,
+      client: client,
+      vid: vid,
+      numSpeakers: numSpeakers,
+      createdAt: new Date().toISOString()
+    }), {
+      httpMetadata: { contentType: 'application/json' }
+    });
+    
+    console.log('[SUCCESS] Both jobs started');
     
     return jsonResponse({
-      jobId: runpodData.id || jobId,
-      message: 'Job started'
+      jobId: jobId,
+      whisperxId: whisperxData.id,
+      pyannoteId: pyannoteData.id,
+      message: 'Jobs started'
     });
     
   } catch (error) {
@@ -189,79 +237,91 @@ async function handleDownloadResult(request, env, filePath) {
 }
 
 async function handleWebhook(request, env, jobId) {
-  console.log('[INFO] Webhook:', jobId);
+  const url = new URL(request.url);
+  const type = url.searchParams.get('type'); // whisperx or pyannote
+  
+  console.log('[INFO] Webhook:', jobId, 'Type:', type);
+  
   try {
     const data = await request.json();
     
-    if (data.status !== 'COMPLETED') {
-      await sendSlack(env, jobId, 'FAILED', null, data.error);
+    if (data.status !== 'succeeded') {
+      await sendSlack(env, jobId, 'FAILED', null, `${type} failed: ${data.error}`);
       return new Response('Job failed', { status: 200 });
     }
     
-    const client = data.input?.client || 'unknown';
-    const vid = data.input?.vid || 'unknown';
+    // ジョブ情報を取得
+    const jobInfoObj = await env.AUDIO_BUCKET.get(`jobs/${jobId}.json`);
+    if (!jobInfoObj) {
+      console.error('[ERROR] Job info not found:', jobId);
+      return new Response('Job info not found', { status: 404 });
+    }
     
-    const fileName = `segments_${jobId}.json`;
+    const jobInfo = JSON.parse(await jobInfoObj.text());
+    const client = jobInfo.client;
+    const vid = jobInfo.vid;
+    
+    // 結果を保存
+    const fileName = `${type}_${jobId}.json`;
     const filePath = `projects/${client}/${vid}/${fileName}`;
     
     await env.RESULT_BUCKET.put(filePath, JSON.stringify(data.output, null, 2), {
       httpMetadata: { contentType: 'application/json' }
     });
     
-    await sendSlack(env, jobId, 'SUCCESS', filePath, null);
+    console.log('[INFO] Saved result:', filePath);
     
-    if (env.APPS_SCRIPT_URL) {
-      console.log('[INFO] Calling Google Apps Script...');
+    // 両方完了したかチェック
+    const whisperxPath = `projects/${client}/${vid}/whisperx_${jobId}.json`;
+    const pyannnotePath = `projects/${client}/${vid}/pyannote_${jobId}.json`;
+    
+    const whisperxExists = await env.RESULT_BUCKET.head(whisperxPath);
+    const pyannoteExists = await env.RESULT_BUCKET.head(pyannnotePath);
+    
+    if (whisperxExists && pyannoteExists) {
+      console.log('[INFO] Both jobs completed!');
+      await sendSlack(env, jobId, 'SUCCESS', filePath, null);
       
-      try {
-        const signedUrl = `https://flat-paper-c3c1.throbbing-shadow-24bc.workers.dev/download-result/${filePath}`;
+      // Google Drive連携（オプション）
+      if (env.APPS_SCRIPT_URL) {
+        console.log('[INFO] Calling Google Apps Script...');
         
-        console.log('[INFO] Apps Script payload:', JSON.stringify({
-          r2_url: signedUrl,
-          file_name: 'segments.json',
-          client: client,
-          vid: vid
-        }));
-        
-        const gasResponse = await fetch(env.APPS_SCRIPT_URL, {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json'
-          },
-          body: JSON.stringify({
-            r2_url: signedUrl,
-            file_name: 'segments.json',
-            client: client,
-            vid: vid
-          })
-        });
-        
-        const gasResult = await gasResponse.json();
-        console.log('[INFO] Apps Script response:', JSON.stringify(gasResult));
-        
-        if (gasResult.success) {
-          console.log('[SUCCESS] Google Drive upload complete:', gasResult.jsonUrl, gasResult.srtUrl);
+        try {
+          const signedUrl = `https://flat-paper-c3c1.throbbing-shadow-24bc.workers.dev/download-result/${filePath}`;
           
-          await fetch(env.SLACK_WEBHOOK_URL, {
+          const gasResponse = await fetch(env.APPS_SCRIPT_URL, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
-              text: '<!channel> Drive保存完了',
-              blocks: [
-                { type: 'header', text: { type: 'plain_text', text: '📁 Drive保存完了' } },
-                { type: 'section', text: { type: 'mrkdwn', text: `<!channel>\n📄 JSON: ${gasResult.jsonUrl}\n📝 SRT: ${gasResult.srtUrl}\n📂 ${gasResult.path}` }}
-              ]
+              r2_url: signedUrl,
+              file_name: fileName,
+              client: client,
+              vid: vid
             })
           });
-        } else {
-          console.log('[ERROR] Google Drive upload failed:', gasResult.error);
-          await sendSlack(env, jobId, 'DRIVE_FAILED', null, gasResult.error);
+          
+          const gasResult = await gasResponse.json();
+          
+          if (gasResult.success) {
+            console.log('[SUCCESS] Google Drive upload complete');
+            await fetch(env.SLACK_WEBHOOK_URL, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                text: '<!channel> Drive保存完了',
+                blocks: [
+                  { type: 'header', text: { type: 'plain_text', text: '📁 Drive保存完了' } },
+                  { type: 'section', text: { type: 'mrkdwn', text: `<!channel>\n📄 JSON: ${gasResult.jsonUrl}\n📝 SRT: ${gasResult.srtUrl}\n📂 ${gasResult.path}` }}
+                ]
+              })
+            });
+          }
+        } catch (error) {
+          console.error('[ERROR] Apps Script call failed:', error.message);
         }
-        
-      } catch (error) {
-        console.error('[ERROR] Apps Script call failed:', error.message);
-        await sendSlack(env, jobId, 'DRIVE_FAILED', null, error.message);
       }
+    } else {
+      console.log('[INFO] Waiting for other job to complete...');
     }
     
     return new Response('OK', { status: 200 });
@@ -273,6 +333,8 @@ async function handleWebhook(request, env, jobId) {
 }
 
 async function sendSlack(env, jobId, status, fileNameOrUrl, error) {
+  if (!env.SLACK_WEBHOOK_URL) return;
+  
   let message;
   
   if (status === 'SUCCESS') {
@@ -283,18 +345,7 @@ async function sendSlack(env, jobId, status, fileNameOrUrl, error) {
         { type: 'section', fields: [
           { type: 'mrkdwn', text: `*ジョブID:*\n\`${jobId}\`` },
           { type: 'mrkdwn', text: `*ファイル:*\n\`${fileNameOrUrl}\`` }
-        ]},
-        { type: 'section', text: { type: 'mrkdwn', 
-          text: `ダウンロード:\n\`\`\`wrangler r2 object get audio-transcription/${fileNameOrUrl} --file result.json --remote\`\`\`` 
-        }}
-      ]
-    };
-  } else if (status === 'DRIVE_FAILED') {
-    message = {
-      text: '<!channel> Drive保存失敗',
-      blocks: [
-        { type: 'header', text: { type: 'plain_text', text: '⚠️ Drive保存失敗' } },
-        { type: 'section', text: { type: 'mrkdwn', text: `<!channel>\nエラー: ${error}` }}
+        ]}
       ]
     };
   } else {
